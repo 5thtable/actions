@@ -1,0 +1,25 @@
+name: Manual tag release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create from the selected branch, for example v1 or v1.2.0"
+        required: true
+
+jobs:
+  create-tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create and push tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+          git tag -f "$TAG"
+          git push -f origin "refs/tags/$TAG"

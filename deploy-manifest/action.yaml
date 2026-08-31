@@ -1,0 +1,157 @@
+name: deploy-manifest
+author: "Elgun Maqsudzada"
+description: "Build and push a service image, render its tag into a Kubernetes manifest, apply it, and wait for the rollout"
+inputs:
+  app-name:
+    description: "Image name within the registry"
+    required: true
+  image-registry:
+    description: "Registry and namespace prefix, for example ghcr.io/my-org"
+    required: true
+  kubeconfig-base64:
+    description: "Base64-encoded kubeconfig for the target cluster"
+    required: true
+  kube-context:
+    description: "Context to select; empty uses the kubeconfig's current context"
+    required: false
+    default: ""
+  manifest-file:
+    description: "Path to the manifest containing the image placeholder"
+    required: true
+  image-placeholder:
+    description: "Literal placeholder in the manifest that the image reference replaces"
+    required: false
+    default: "<container-image>"
+  working-directory:
+    description: "Directory to build from and resolve the manifest path against"
+    required: false
+    default: "."
+  dockerfile:
+    description: "Dockerfile path relative to the working directory"
+    required: false
+    default: "Dockerfile"
+  additional-tag:
+    description: "Environment marker prefixed to the tag, for example dev or prod"
+    required: false
+    default: ""
+  rollout-deployment:
+    description: "Deployment name to wait on after apply; empty skips the wait"
+    required: false
+    default: ""
+  rollout-namespace:
+    description: "Namespace of the rollout deployment"
+    required: false
+    default: "default"
+  rollout-timeout:
+    description: "How long to wait for the rollout"
+    required: false
+    default: "300s"
+  cleanup-local-image:
+    description: "Remove the built image from the local docker daemon afterwards; useful on self-hosted runners"
+    required: false
+    default: "false"
+outputs:
+  image:
+    description: "Fully qualified image reference that was deployed"
+    value: ${{ steps.tag.outputs.image }}
+runs:
+  using: composite
+  steps:
+    - id: tag
+      shell: bash
+      env:
+        APP_NAME: ${{ inputs.app-name }}
+        IMAGE_REGISTRY: ${{ inputs.image-registry }}
+        ADDITIONAL_TAG: ${{ inputs.additional-tag }}
+      run: |
+        SHA_SHORT="${GITHUB_SHA::7}"
+        TAG="$SHA_SHORT.$GITHUB_RUN_NUMBER"
+        if [ -n "$ADDITIONAL_TAG" ]; then
+          TAG="$ADDITIONAL_TAG.$TAG"
+        fi
+        IMAGE="$IMAGE_REGISTRY/$APP_NAME:$TAG"
+        echo "Image reference: $IMAGE"
+        echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+    - id: build
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        IMAGE: ${{ steps.tag.outputs.image }}
+        DOCKERFILE: ${{ inputs.dockerfile }}
+      run: docker build --pull -f "$DOCKERFILE" -t "$IMAGE" .
+
+    - id: push
+      shell: bash
+      env:
+        IMAGE: ${{ steps.tag.outputs.image }}
+      run: docker push "$IMAGE"
+
+    - id: kubeconfig
+      shell: bash
+      env:
+        KUBECONFIG_B64: ${{ inputs.kubeconfig-base64 }}
+      run: |
+        CONFIG_FILE=$(mktemp "$RUNNER_TEMP/kubeconfig.XXXXXX")
+        printf '%s' "$KUBECONFIG_B64" | base64 -d > "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE"
+        echo "KUBECONFIG=$CONFIG_FILE" >> "$GITHUB_ENV"
+        echo "config-file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+
+    - id: apply
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        IMAGE: ${{ steps.tag.outputs.image }}
+        MANIFEST_FILE: ${{ inputs.manifest-file }}
+        IMAGE_PLACEHOLDER: ${{ inputs.image-placeholder }}
+        KUBE_CONTEXT: ${{ inputs.kube-context }}
+      run: |
+        CONTEXT_ARGS=()
+        if [ -n "$KUBE_CONTEXT" ]; then
+          CONTEXT_ARGS=(--context "$KUBE_CONTEXT")
+        fi
+        RENDERED=$(mktemp "$RUNNER_TEMP/manifest.XXXXXX.yaml")
+        PLACEHOLDER="$IMAGE_PLACEHOLDER" REPLACEMENT="$IMAGE" python3 - "$MANIFEST_FILE" "$RENDERED" <<'PYEOF'
+        import os, sys
+        source, target = sys.argv[1], sys.argv[2]
+        content = open(source).read()
+        placeholder = os.environ["PLACEHOLDER"]
+        if placeholder not in content:
+            sys.exit(f"placeholder {placeholder!r} not found in {source}")
+        open(target, "w").write(content.replace(placeholder, os.environ["REPLACEMENT"]))
+        PYEOF
+        kubectl "${CONTEXT_ARGS[@]}" apply -f "$RENDERED"
+        rm -f "$RENDERED"
+
+    - id: rollout
+      if: inputs.rollout-deployment != ''
+      shell: bash
+      env:
+        KUBE_CONTEXT: ${{ inputs.kube-context }}
+        DEPLOYMENT: ${{ inputs.rollout-deployment }}
+        NAMESPACE: ${{ inputs.rollout-namespace }}
+        TIMEOUT: ${{ inputs.rollout-timeout }}
+      run: |
+        CONTEXT_ARGS=()
+        if [ -n "$KUBE_CONTEXT" ]; then
+          CONTEXT_ARGS=(--context "$KUBE_CONTEXT")
+        fi
+        kubectl "${CONTEXT_ARGS[@]}" -n "$NAMESPACE" rollout status "deployment/$DEPLOYMENT" --timeout="$TIMEOUT"
+
+    - name: Remove local image
+      if: inputs.cleanup-local-image == 'true'
+      shell: bash
+      env:
+        IMAGE: ${{ steps.tag.outputs.image }}
+      run: docker rmi "$IMAGE"
+
+    - name: Remove kubeconfig
+      if: always()
+      shell: bash
+      env:
+        CONFIG_FILE: ${{ steps.kubeconfig.outputs.config-file }}
+      run: |
+        if [ -n "$CONFIG_FILE" ]; then
+          rm -f "$CONFIG_FILE"
+        fi

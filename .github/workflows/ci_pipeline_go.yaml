@@ -1,0 +1,31 @@
+name: Build and analyze
+
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        description: "Go toolchain version"
+        required: false
+        type: string
+        default: "1.25"
+      working-directory:
+        description: "Module directory"
+        required: false
+        type: string
+        default: "."
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-code:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test
+        uses: ElgunMagsudzada/actions/go-build@v1
+        with:
+          go-version: ${{ inputs.go-version }}
+          working-directory: ${{ inputs.working-directory }}
