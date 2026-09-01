@@ -25,7 +25,7 @@ on:
   pull_request:
 jobs:
   ci:
-    uses: ElgunMagsudzada/actions/.github/workflows/ci_pipeline_go.yaml@v1
+    uses: 5thtable/actions/.github/workflows/ci_pipeline_go.yaml@v1
     with:
       go-version: "1.25"
 ```
@@ -39,7 +39,7 @@ on:
     branches: [main]
 jobs:
   cd:
-    uses: ElgunMagsudzada/actions/.github/workflows/cd_pipeline_go.yaml@v1
+    uses: 5thtable/actions/.github/workflows/cd_pipeline_go.yaml@v1
     with:
       image-registry: ghcr.io/my-org
       target-environment: development

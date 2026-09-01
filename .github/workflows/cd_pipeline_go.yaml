@@ -120,7 +120,7 @@ jobs:
           echo "file=$SELECTED" >> "$GITHUB_OUTPUT"
 
       - name: Deploy
-        uses: ElgunMagsudzada/actions/deploy-manifest@v1
+        uses: 5thtable/actions/deploy-manifest@v1
         with:
           app-name: ${{ inputs.app-name }}
           image-registry: ${{ inputs.image-registry }}
@@ -149,7 +149,7 @@ jobs:
           password: ${{ secrets.registry-password }}
 
       - name: Deploy
-        uses: ElgunMagsudzada/actions/deploy-manifest@v1
+        uses: 5thtable/actions/deploy-manifest@v1
         with:
           app-name: ${{ inputs.app-name }}
           image-registry: ${{ inputs.image-registry }}
