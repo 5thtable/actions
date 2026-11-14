@@ -168,8 +168,20 @@ jobs:
       - name: Build the Android App Bundle
         env:
           BUILD_PROFILE: ${{ inputs.build-profile }}
+          GRADLE_USER_HOME: ${{ runner.temp }}/unity-android-gradle
         run: |
           unset ANDROID_HOME ANDROID_SDK_ROOT ANDROID_NDK ANDROID_NDK_HOME ANDROID_NDK_LATEST_HOME ANDROID_NDK_ROOT
+          mkdir -p "$GRADLE_USER_HOME/init.d"
+          cat > "$GRADLE_USER_HOME/init.d/plugin-repositories.init.gradle" <<'GRADLE'
+          gradle.settingsEvaluated { settings ->
+              def repositories = settings.pluginManagement.repositories
+              def pluginPortal = repositories.findByName('Gradle Central Plugin Repository')
+              if (pluginPortal != null) {
+                  repositories.remove(pluginPortal)
+                  repositories.addLast(pluginPortal)
+              }
+          }
+          GRADLE
           build_dir="$RUNNER_TEMP/unity-android-build"
           mkdir -p "$build_dir"
           unity build "$GITHUB_WORKSPACE" --profile "$BUILD_PROFILE" \
