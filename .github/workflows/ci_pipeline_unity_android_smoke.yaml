@@ -11,6 +11,10 @@ on:
         description: Expected Android application ID
         type: string
         required: true
+      accept-personal-terms:
+        description: Allow explicit Unity Personal activation under the Unity Editor Software Terms
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -30,39 +34,18 @@ jobs:
       UNITY_NO_AGENT_HINTS: '1'
 
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          fetch-depth: 0
-          lfs: true
-          persist-credentials: false
-
-      - name: Install the project's Unity Editor and Android tools
+      - name: Install the Unity CLI
         env:
-          BUILD_PROFILE: ${{ inputs.build-profile }}
           UNITY_CLI_HOME: ${{ runner.temp }}/unity-cli
           UNITY_CLI_VERSION: '1.0.0'
         run: |
           test "$RUNNER_ENVIRONMENT" = github-hosted
-          test -f "$BUILD_PROFILE"
-          editor_version="$(awk '$1 == "m_EditorVersion:" {print $2}' ProjectSettings/ProjectVersion.txt)"
-          test -n "$editor_version"
-          if [[ "${ANDROID_HOME:-}" == /usr/local/lib/android/sdk ]]; then
-            sudo rm -rf -- /usr/local/lib/android/sdk
-          fi
-          df -h "$RUNNER_TEMP"
-
           installer="$RUNNER_TEMP/unity-install.sh"
           curl -fsSL --retry 3 https://unity.com/install.sh -o "$installer"
           bash "$installer"
           unity="$UNITY_CLI_HOME/bin/unity"
           test "$("$unity" --version)" = "$UNITY_CLI_VERSION"
           printf '%s\n' "$UNITY_CLI_HOME/bin" >> "$GITHUB_PATH"
-
-          mkdir -p "$RUNNER_TEMP/unity-editors"
-          "$unity" install-path --set "$RUNNER_TEMP/unity-editors" --non-interactive
-          "$unity" install "$editor_version" --module android --child-modules --yes --non-interactive --accept-eula
-          "$unity" cache clean --yes --non-interactive
-          df -h "$RUNNER_TEMP"
 
       - name: Sign in to Unity in your browser
         id: unity-login
@@ -72,10 +55,87 @@ jobs:
           timeout 9m unity auth login --format json >/dev/null
 
       - name: Activate Unity Personal
+        env:
+          UNITY_PERSONAL_TERMS_ACCEPTED: ${{ inputs.accept-personal-terms }}
         run: |
-          unity license activate --non-interactive
-          unity license status --format json |
-            jq -e '.success and .data.active and any(.data.licenses[]?; .product == "Unity Personal")' >/dev/null
+          umask 077
+          activation_report="$RUNNER_TEMP/unity-activation.json"
+          license_report="$RUNNER_TEMP/unity-license-status.json"
+          trap 'rm -f -- "$activation_report" "$license_report"' EXIT
+
+          activate_license() {
+            local result=0
+            unity license activate "$@" --non-interactive --format json > "$activation_report" 2>/dev/null || result=$?
+            printf 'Unity license activation exited %s.\n' "$result"
+            jq -ce '{success, errors: [.errors[]?.code]}' "$activation_report" || {
+              printf '%s\n' '::error::Unity activation returned no valid JSON diagnosis.'
+              return 1
+            }
+            return "$result"
+          }
+
+          read_license_status() {
+            local result=0
+            unity license status --non-interactive --format json > "$license_report" 2>/dev/null || result=$?
+            printf 'Unity license status exited %s.\n' "$result"
+            jq -ce '{active: .data.active, signedIn: .data.signedIn, products: [.data.licenses[]?.product], errors: [.errors[]?.code]}' "$license_report"
+            if [[ "$result" != 0 && "$result" != 4 ]]; then
+              return "$result"
+            fi
+          }
+
+          has_personal_license() {
+            jq -e '.success == true and .data.active == true and any(.data.licenses[]?; .product == "Unity Personal")' "$license_report" >/dev/null
+          }
+
+          printf '%s\n' 'Activating the assigned Unity entitlements for the signed-in account.'
+          activate_license || true
+          read_license_status
+          if has_personal_license; then
+            printf '%s\n' 'Unity Personal is active on this runner.'
+            exit 0
+          fi
+
+          if ! jq -e '.data.signedIn == true' "$license_report" >/dev/null; then
+            printf '%s\n' '::error::The Unity sign-in session was unavailable during license activation.'
+            exit 1
+          fi
+          if [[ "$UNITY_PERSONAL_TERMS_ACCEPTED" != true ]]; then
+            printf '%s\n' '::error::No active Unity Personal license. To try explicit Personal activation, accept the Unity Editor Software Terms in the Run workflow form.'
+            exit 1
+          fi
+
+          printf '%s\n' 'Retrying activation in Unity Personal mode.'
+          activate_license --personal --accept-eula
+          read_license_status
+          if ! has_personal_license; then
+            printf '%s\n' '::error::Unity Personal activation finished without an active Personal license.'
+            exit 1
+          fi
+          printf '%s\n' 'Unity Personal is active on this runner.'
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+          lfs: true
+          persist-credentials: false
+
+      - name: Install the project's Unity Editor and Android tools
+        env:
+          BUILD_PROFILE: ${{ inputs.build-profile }}
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test -f "$BUILD_PROFILE"
+          editor_version="$(awk '$1 == "m_EditorVersion:" {print $2}' ProjectSettings/ProjectVersion.txt)"
+          test -n "$editor_version"
+          sudo rm -rf --one-file-system -- /usr/local/lib/android/sdk /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL
+          df -h "$RUNNER_TEMP"
+
+          mkdir -p "$RUNNER_TEMP/unity-editors"
+          unity install-path --set "$RUNNER_TEMP/unity-editors" --non-interactive
+          unity install "$editor_version" --module android --child-modules --yes --non-interactive --accept-eula
+          unity cache clean --yes --non-interactive
+          df -h "$RUNNER_TEMP"
 
       - name: Build the Android App Bundle
         env:
@@ -85,7 +145,7 @@ jobs:
           build_dir="$RUNNER_TEMP/unity-android-build"
           mkdir -p "$build_dir"
           unity build "$GITHUB_WORKSPACE" --profile "$BUILD_PROFILE" \
-            --output-path "$build_dir/Player.aab" --log-file "$build_dir/unity.log" --no-tail --non-interactive
+            --output-path "$build_dir/Player.aab" --log-file "$build_dir/unity.log" --format human --non-interactive
 
       - name: Check the Android bundle
         env:
