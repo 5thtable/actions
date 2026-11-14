@@ -1,0 +1,131 @@
+name: Unity Android Hosted Build
+
+on:
+  workflow_call:
+    inputs:
+      build-profile:
+        description: Android AAB build profile relative to the Unity project
+        type: string
+        required: true
+      application-id:
+        description: Expected Android application ID
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' && github.event.repository.private && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      UNITY_NO_BANNER: '1'
+      UNITY_NO_PAGER: '1'
+      UNITY_NO_AGENT_HINTS: '1'
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+          lfs: true
+          persist-credentials: false
+
+      - name: Install the project's Unity Editor and Android tools
+        env:
+          BUILD_PROFILE: ${{ inputs.build-profile }}
+          UNITY_CLI_HOME: ${{ runner.temp }}/unity-cli
+          UNITY_CLI_VERSION: '1.0.0'
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test -f "$BUILD_PROFILE"
+          editor_version="$(awk '$1 == "m_EditorVersion:" {print $2}' ProjectSettings/ProjectVersion.txt)"
+          test -n "$editor_version"
+          if [[ "${ANDROID_HOME:-}" == /usr/local/lib/android/sdk ]]; then
+            sudo rm -rf -- /usr/local/lib/android/sdk
+          fi
+          df -h "$RUNNER_TEMP"
+
+          installer="$RUNNER_TEMP/unity-install.sh"
+          curl -fsSL --retry 3 https://unity.com/install.sh -o "$installer"
+          bash "$installer"
+          unity="$UNITY_CLI_HOME/bin/unity"
+          test "$("$unity" --version)" = "$UNITY_CLI_VERSION"
+          printf '%s\n' "$UNITY_CLI_HOME/bin" >> "$GITHUB_PATH"
+
+          mkdir -p "$RUNNER_TEMP/unity-editors"
+          "$unity" install-path --set "$RUNNER_TEMP/unity-editors" --non-interactive
+          "$unity" install "$editor_version" --module android --child-modules --yes --non-interactive --accept-eula
+          "$unity" cache clean --yes --non-interactive
+          df -h "$RUNNER_TEMP"
+
+      - name: Sign in to Unity in your browser
+        id: unity-login
+        timeout-minutes: 10
+        run: |
+          printf '%s\n' 'Open the auth_url below in your browser. Sign in with your Unity Personal account.'
+          timeout 9m unity auth login --format json >/dev/null
+
+      - name: Activate Unity Personal
+        run: |
+          unity license activate --non-interactive
+          unity license status --format json |
+            jq -e '.success and .data.active and any(.data.licenses[]?; .product == "Unity Personal")' >/dev/null
+
+      - name: Build the Android App Bundle
+        env:
+          BUILD_PROFILE: ${{ inputs.build-profile }}
+        run: |
+          unset ANDROID_HOME ANDROID_SDK_ROOT ANDROID_NDK ANDROID_NDK_HOME ANDROID_NDK_LATEST_HOME ANDROID_NDK_ROOT
+          build_dir="$RUNNER_TEMP/unity-android-build"
+          mkdir -p "$build_dir"
+          unity build "$GITHUB_WORKSPACE" --profile "$BUILD_PROFILE" \
+            --output-path "$build_dir/Player.aab" --log-file "$build_dir/unity.log" --no-tail --non-interactive
+
+      - name: Check the Android bundle
+        env:
+          APPLICATION_ID: ${{ inputs.application-id }}
+        run: |
+          build_dir="$RUNNER_TEMP/unity-android-build"
+          cd "$build_dir"
+          test -s Player.aab
+          bundletool="$RUNNER_TEMP/bundletool.jar"
+          curl -fsSL --retry 3 https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar -o "$bundletool"
+          printf '%s  %s\n' a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29 "$bundletool" | sha256sum --check
+          java -jar "$bundletool" validate --bundle=Player.aab
+          java -jar "$bundletool" dump manifest --bundle=Player.aab > android-manifest.xml
+          package_id="$(java -jar "$bundletool" dump manifest --bundle=Player.aab --xpath=/manifest/@package)"
+          if [[ "$package_id" != "$APPLICATION_ID" ]]; then
+            printf 'Expected package %s, found %s\n' "$APPLICATION_ID" "$package_id" >&2
+            exit 1
+          fi
+          version_code="$(java -jar "$bundletool" dump manifest --bundle=Player.aab --xpath=/manifest/@android:versionCode)"
+          sha256sum Player.aab > SHA256SUMS
+          printf 'Commit %s\nPackage %s\nVersion code %s\n' "$GITHUB_SHA" "$package_id" "$version_code" > build-info.txt
+
+      - name: Keep the test bundle in GitHub Actions
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: unity-android-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/unity-android-build/Player.aab
+            ${{ runner.temp }}/unity-android-build/SHA256SUMS
+            ${{ runner.temp }}/unity-android-build/android-manifest.xml
+            ${{ runner.temp }}/unity-android-build/build-info.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Return the runner's license and sign out
+        if: always() && steps.unity-login.outcome == 'success'
+        timeout-minutes: 5
+        run: |
+          license_result=0
+          unity license return --yes --non-interactive || license_result=$?
+          unity auth logout --yes --non-interactive
+          exit "$license_result"
