@@ -120,20 +120,48 @@ jobs:
           lfs: true
           persist-credentials: false
 
-      - name: Install the project's Unity Editor and Android tools
+      - name: Prepare Unity toolchain installation
+        id: toolchain
         env:
           BUILD_PROFILE: ${{ inputs.build-profile }}
         run: |
           test "$RUNNER_ENVIRONMENT" = github-hosted
           test -f "$BUILD_PROFILE"
           editor_version="$(awk '$1 == "m_EditorVersion:" {print $2}' ProjectSettings/ProjectVersion.txt)"
-          test -n "$editor_version"
+          [[ "$editor_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+[abfp][0-9]+$ ]]
           sudo rm -rf --one-file-system -- /usr/local/lib/android/sdk /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL
           df -h "$RUNNER_TEMP"
+          download_path="$(unity cache info --format json | jq -er '.data.path | select(type == "string" and length > 0)')"
+          printf 'editor-version=%s\ndownload-path=%s\n' "$editor_version" "$download_path" >> "$GITHUB_OUTPUT"
 
+      - name: Restore Unity installer archives
+        id: unity-downloads
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: ${{ steps.toolchain.outputs.download-path }}
+          key: unity-downloads-ubuntu24-x64-android-${{ steps.toolchain.outputs.editor-version }}
+
+      - name: Download Unity and Android installer archives
+        if: steps.unity-downloads.outputs.cache-hit != 'true'
+        env:
+          EDITOR_VERSION: ${{ steps.toolchain.outputs.editor-version }}
+        run: |
+          unity install "$EDITOR_VERSION" --download-only --module android --child-modules --yes --non-interactive --accept-eula
+
+      - name: Save Unity installer archives
+        if: steps.unity-downloads.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: ${{ steps.toolchain.outputs.download-path }}
+          key: ${{ steps.unity-downloads.outputs.cache-primary-key }}
+
+      - name: Install the project's Unity Editor and Android tools
+        env:
+          EDITOR_VERSION: ${{ steps.toolchain.outputs.editor-version }}
+        run: |
           mkdir -p "$RUNNER_TEMP/unity-editors"
           unity install-path --set "$RUNNER_TEMP/unity-editors" --non-interactive
-          unity install "$editor_version" --module android --child-modules --yes --non-interactive --accept-eula
+          unity install "$EDITOR_VERSION" --module android --child-modules --yes --non-interactive --accept-eula
           unity cache clean --yes --non-interactive
           df -h "$RUNNER_TEMP"
 
@@ -145,6 +173,7 @@ jobs:
           build_dir="$RUNNER_TEMP/unity-android-build"
           mkdir -p "$build_dir"
           unity build "$GITHUB_WORKSPACE" --profile "$BUILD_PROFILE" \
+            --args='-refreshImportMode InProcess' \
             --output-path "$build_dir/Player.aab" --log-file "$build_dir/unity.log" --format human --non-interactive
 
       - name: Check the Android bundle
@@ -181,11 +210,7 @@ jobs:
           compression-level: 0
           retention-days: 7
 
-      - name: Return the runner's license and sign out
+      - name: Sign out of Unity
         if: always() && steps.unity-login.outcome == 'success'
         timeout-minutes: 5
-        run: |
-          license_result=0
-          unity license return --yes --non-interactive || license_result=$?
-          unity auth logout --yes --non-interactive
-          exit "$license_result"
+        run: unity auth logout --yes --non-interactive
