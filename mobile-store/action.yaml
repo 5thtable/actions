@@ -1,0 +1,90 @@
+name: mobile-store
+description: Deliver signed Android and iOS builds to their internal tester tracks
+inputs:
+  operation:
+    description: play, app-store-connect, or testflight
+    required: true
+  application-id:
+    description: Android application ID and iOS bundle ID
+    required: true
+  build-number:
+    description: Verified build number
+    required: true
+  app-version:
+    description: Verified iOS version
+    required: false
+  artifact-directory:
+    description: Directory containing verified build and checksum
+    required: false
+runs:
+  using: composite
+  steps:
+    - name: Check internal publishing configuration
+      shell: bash
+      env:
+        MOBILE_STORE_OPERATION: ${{ inputs.operation }}
+        MOBILE_APPLICATION_ID: ${{ inputs.application-id }}
+        MOBILE_BUILD_NUMBER: ${{ inputs.build-number }}
+        MOBILE_APP_VERSION: ${{ inputs.app-version }}
+      run: |
+        [[ "$MOBILE_APPLICATION_ID" =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]]
+        [[ "$MOBILE_BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]]
+        case "$MOBILE_STORE_OPERATION" in
+          play)
+            if [[ ! -f "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
+              echo '::error::Configure Google Play workload identity in the play-internal environment.'
+              exit 1
+            fi
+            ;;
+          app-store-connect|testflight)
+            [[ "$MOBILE_APP_VERSION" =~ ^[0-9]+\.[0-9]+\.$MOBILE_BUILD_NUMBER$ ]]
+            for setting in APP_STORE_CONNECT_KEY_ID APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_KEY_BASE64 TESTFLIGHT_INTERNAL_GROUP; do
+              if [[ -z "${!setting}" ]]; then
+                printf '::error::Set %s in the testflight-internal environment.\n' "$setting"
+                exit 1
+              fi
+            done
+            ;;
+          *)
+            echo '::error::Select a supported internal store operation.'
+            exit 1
+            ;;
+        esac
+
+    - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199
+      with:
+        ruby-version: "3.3"
+
+    - name: Install Fastlane
+      shell: bash
+      run: gem install fastlane --version 2.241.2 --no-document
+
+    - name: Deliver the internal build
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      env:
+        MOBILE_STORE_OPERATION: ${{ inputs.operation }}
+        MOBILE_APPLICATION_ID: ${{ inputs.application-id }}
+        MOBILE_BUILD_NUMBER: ${{ inputs.build-number }}
+        MOBILE_APP_VERSION: ${{ inputs.app-version }}
+        MOBILE_STORE_ARTIFACT_DIR: ${{ inputs.artifact-directory }}
+        FASTLANE_SKIP_UPDATE_CHECK: "1"
+        FASTLANE_OPT_OUT_USAGE: "1"
+      run: |
+        case "$MOBILE_STORE_OPERATION" in
+          play)
+            (cd "$MOBILE_STORE_ARTIFACT_DIR" && sha256sum --check SHA256SUMS)
+            fastlane android publish_internal
+            ;;
+          app-store-connect)
+            (cd "$MOBILE_STORE_ARTIFACT_DIR" && shasum -a 256 --check SHA256SUMS)
+            fastlane ios upload_internal
+            ;;
+          testflight)
+            fastlane ios distribute_internal
+            ;;
+          *)
+            echo "Select a supported internal store operation." >&2
+            exit 1
+            ;;
+        esac

@@ -6,6 +6,13 @@ signing_scripts="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 : "${IOS_CERTIFICATE_BASE64:?Configure the Apple distribution certificate}"
 : "${IOS_CERTIFICATE_PASSWORD:?Configure the Apple distribution certificate password}"
 : "${IOS_PROVISIONING_PROFILE_BASE64:?Configure the App Store provisioning profile}"
+MOBILE_BUILD_NUMBER="${MOBILE_BUILD_NUMBER:-$(cat "$MOBILE_BUILD_INPUT/build-number.txt")}"
+if [[ -f "$MOBILE_BUILD_INPUT/source-commit.txt" ]]; then
+  MOBILE_SOURCE_SHA="$(cat "$MOBILE_BUILD_INPUT/source-commit.txt")"
+fi
+MOBILE_SOURCE_SHA="${MOBILE_SOURCE_SHA:-$GITHUB_SHA}"
+[[ "$MOBILE_BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]]
+[[ "$MOBILE_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
 signing_dir="$(mktemp -d "$RUNNER_TEMP/ios-signing.XXXXXX")"
 keychain="$signing_dir/signing.keychain-db"
 installed_profile=
@@ -112,5 +119,5 @@ fi
     shasum -a 256 Player-dSYMs.zip >> SHA256SUMS
   fi
 )
-printf 'Commit %s\nBuild %s\nVersion %s\n' "${MOBILE_SOURCE_SHA:-$GITHUB_SHA}" "$build_number" "$version" > "$MOBILE_BUILD_OUTPUT/build-info.txt"
-printf 'app-version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+printf 'Commit %s\nBuild %s\nVersion %s\n' "$MOBILE_SOURCE_SHA" "$build_number" "$version" > "$MOBILE_BUILD_OUTPUT/build-info.txt"
+printf 'app-version=%s\nbuild-number=%s\n' "$version" "$build_number" >> "$GITHUB_OUTPUT"

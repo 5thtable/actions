@@ -1,0 +1,176 @@
+default_platform(:ios)
+
+def app_store_connect_key
+  names = %w[APP_STORE_CONNECT_KEY_ID APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_KEY_BASE64]
+  missing = names.select { |name| ENV[name].to_s.empty? }
+  UI.user_error!("Missing App Store Connect variables: #{missing.join(', ')}") unless missing.empty?
+
+  app_store_connect_api_key(
+    key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+    issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+    key_content: ENV.fetch("APP_STORE_CONNECT_KEY_BASE64"),
+    is_key_content_base64: true
+  )
+end
+
+def internal_testflight_group(app)
+  name = ENV.fetch("TESTFLIGHT_INTERNAL_GROUP", "").strip
+  UI.user_error!("Set TESTFLIGHT_INTERNAL_GROUP in the testflight-internal environment.") if name.empty?
+  group = app.get_beta_groups.find do |candidate|
+    candidate.is_internal_group && candidate.name == name
+  end
+  UI.user_error!("Configure an existing internal TestFlight group for the app.") unless group
+  group
+end
+
+def check_testflight_version_available(app)
+  build_number = ENV.fetch("MOBILE_BUILD_NUMBER")
+  app_version = ENV.fetch("MOBILE_APP_VERSION")
+  builds = Spaceship::ConnectAPI::Build.all(
+    app_id: app.id,
+    version: app_version,
+    build_number: build_number,
+    platform: "IOS",
+    limit: 2
+  )
+  if builds.any?
+    UI.user_error!("App Store Connect already has #{app_version} (#{build_number}). Select a new build number for a fresh upload.")
+  end
+end
+
+def verify_testflight_compliance(build)
+  detail = build.build_beta_detail
+  return detail unless detail&.internal_build_state == "MISSING_EXPORT_COMPLIANCE"
+
+  if ENV["TESTFLIGHT_USES_NON_EXEMPT_ENCRYPTION"] == "false" && build.uses_non_exempt_encryption.nil?
+    Spaceship::ConnectAPI.patch_builds(build_id: build.id, attributes: { usesNonExemptEncryption: false })
+    18.times do
+      sleep 5
+      detail = Spaceship::ConnectAPI::Build.get(build_id: build.id, includes: "buildBetaDetail")&.build_beta_detail
+      return detail if %w[READY_FOR_BETA_TESTING IN_BETA_TESTING].include?(detail&.internal_build_state)
+    end
+  end
+  UI.user_error!("Complete export compliance for the signed build in App Store Connect, then rerun this distribution job.")
+end
+
+def published_play_bundle?(identifier, aab, version)
+  require "digest"
+  require "supply"
+
+  client = Supply::Client.make_from_config(params: { timeout: 60 })
+  client.begin_edit(package_name: identifier)
+  releases = client.track_releases("internal")
+  release = releases.find { |candidate| Array(candidate.version_codes).map(&:to_i).include?(version) }
+  unless release
+    if releases.any? { |candidate| Array(candidate.version_codes).any? { |code| code.to_i > version } }
+      UI.user_error!("Play Internal testing already has a newer version than #{version}.")
+    end
+    return false
+  end
+
+  bundles = client.client.list_edit_bundles(identifier, client.current_edit.id).bundles
+  bundle = Array(bundles).find { |candidate| candidate.version_code.to_i == version }
+  unless bundle && bundle.sha256.to_s.casecmp?(Digest::SHA256.file(aab).hexdigest)
+    UI.user_error!("Play Internal testing has version #{version} with a different or unavailable bundle checksum.")
+  end
+  UI.user_error!("Play Internal testing has version #{version} in status #{release.status}.") unless release.status == "completed"
+  true
+ensure
+  client.abort_current_edit if client&.current_edit
+end
+
+platform :ios do
+  desc "Upload a signed IPA to App Store Connect"
+  lane :upload_internal do
+    ipa = File.join(ENV.fetch("MOBILE_STORE_ARTIFACT_DIR"), "Player.ipa")
+    UI.user_error!("The signed IPA is missing.") unless File.file?(ipa)
+
+    identifier = ENV.fetch("MOBILE_APPLICATION_ID")
+    key = app_store_connect_key
+    app = Spaceship::ConnectAPI::App.find(identifier)
+    UI.user_error!("The app is missing in App Store Connect.") unless app
+    internal_testflight_group(app)
+    check_testflight_version_available(app)
+
+    upload_to_testflight(
+      api_key: key,
+      app_identifier: identifier,
+      ipa: ipa,
+      skip_waiting_for_build_processing: true,
+      skip_submission: true,
+      distribute_external: false
+    )
+  end
+
+  desc "Distribute the processed app to the configured internal TestFlight group"
+  lane :distribute_internal do
+    require "fastlane_core/build_watcher"
+
+    app_store_connect_key
+    app = Spaceship::ConnectAPI::App.find(ENV.fetch("MOBILE_APPLICATION_ID"))
+    UI.user_error!("The app is missing in App Store Connect.") unless app
+    group = internal_testflight_group(app)
+    build_number = ENV.fetch("MOBILE_BUILD_NUMBER")
+    app_version = ENV.fetch("MOBILE_APP_VERSION")
+    UI.user_error!("Missing the uploaded TestFlight build identity.") if build_number.empty? || app_version.empty?
+
+    build = FastlaneCore::BuildWatcher.wait_for_build_processing_to_be_complete(
+      app_id: app.id,
+      app_version: app_version,
+      build_version: build_number,
+      platform: "ios",
+      timeout_duration: 1800,
+      poll_interval: 30,
+      return_spaceship_testflight_build: false,
+      wait_for_build_beta_detail_processing: true
+    )
+    if build.processing_state != "VALID" || build.expired
+      UI.user_error!("App Store Connect has not accepted build #{app_version} (#{build_number}) for testing.")
+    end
+
+    testing_state = verify_testflight_compliance(build)&.internal_build_state
+    unless %w[READY_FOR_BETA_TESTING IN_BETA_TESTING].include?(testing_state)
+      UI.user_error!("Build #{build_number} has TestFlight status #{testing_state}. Check its status in App Store Connect before retrying distribution.")
+    end
+    unless group.has_access_to_all_builds || group.fetch_builds.any? { |candidate| candidate.id == build.id }
+      build.add_beta_groups(beta_groups: [group])
+    end
+    visible = 6.times.any? do |attempt|
+      sleep 5 if attempt.positive?
+      group.fetch_builds.any? { |candidate| candidate.id == build.id }
+    end
+    unless visible
+      UI.user_error!("App Store Connect did not report build #{build_number} in the internal group.")
+    end
+    UI.success("Verified build #{app_version} (#{build_number}) in the internal TestFlight group.")
+  end
+end
+
+platform :android do
+  desc "Upload a signed AAB to Google Play Internal testing"
+  lane :publish_internal do
+    aab = File.join(ENV.fetch("MOBILE_STORE_ARTIFACT_DIR"), "Player.aab")
+    UI.user_error!("The signed AAB is missing.") unless File.file?(aab)
+
+    identifier = ENV.fetch("MOBILE_APPLICATION_ID")
+    version = Integer(ENV.fetch("MOBILE_BUILD_NUMBER"), 10)
+    unless published_play_bundle?(identifier, aab, version)
+      upload_to_play_store(
+        package_name: identifier,
+        aab: aab,
+        track: "internal",
+        release_status: "completed",
+        skip_upload_apk: true,
+        skip_upload_metadata: true,
+        skip_upload_changelogs: true,
+        skip_upload_images: true,
+        skip_upload_screenshots: true
+      )
+
+      unless published_play_bundle?(identifier, aab, version)
+        UI.user_error!("Google Play did not report the new version on the internal track.")
+      end
+    end
+    UI.success("Verified version #{version} on the Play Internal testing track.")
+  end
+end
