@@ -1,0 +1,241 @@
+name: Build one Unity mobile platform
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: Unity build target, Android or iOS
+        type: string
+        required: true
+      build-profile:
+        description: Build profile relative to the Unity project
+        type: string
+        required: true
+      source-commit:
+        description: Optional full SHA already in the default branch history
+        type: string
+        default: ''
+      accept-personal-terms:
+        description: Allow Unity Personal activation under the Unity Editor Software Terms
+        type: boolean
+        default: false
+    outputs:
+      artifact:
+        description: Artifact ID for the platform signing job
+        value: ${{ jobs.build.outputs.artifact }}
+
+permissions:
+  actions: read
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Unity
+    if: github.event_name == 'workflow_dispatch' && github.event.repository.private && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      UNITY_NO_BANNER: '1'
+      UNITY_NO_PAGER: '1'
+      UNITY_NO_AGENT_HINTS: '1'
+    outputs:
+      artifact: ${{ steps.xcode-artifact.outputs.artifact-id || steps.android-artifact.outputs.artifact-id }}
+    steps:
+      - name: Check build inputs
+        env:
+          PLATFORM: ${{ inputs.platform }}
+          BUILD_PROFILE: ${{ inputs.build-profile }}
+          SOURCE_COMMIT: ${{ inputs.source-commit }}
+          PERSONAL_TERMS_ACCEPTED: ${{ inputs.accept-personal-terms }}
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          case "$PLATFORM" in
+            android|ios) test -n "$BUILD_PROFILE" ;;
+            *) echo '::error::Select Android or iOS for this Unity build.'; exit 1 ;;
+          esac
+          if [[ "$PERSONAL_TERMS_ACCEPTED" != true ]]; then
+            echo '::error::Allow Unity Personal activation under the Unity Editor Software Terms in the Run workflow form.'
+            exit 1
+          fi
+          if [[ -n "$SOURCE_COMMIT" && ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::Enter the full commit SHA from the default branch.'
+            exit 1
+          fi
+
+      - name: Install the Unity CLI
+        env:
+          UNITY_CLI_HOME: ${{ runner.temp }}/unity-cli
+          UNITY_CLI_VERSION: '1.0.0'
+        run: |
+          installer="$RUNNER_TEMP/unity-install.sh"
+          curl -fsSL --retry 3 https://unity.com/install.sh -o "$installer"
+          bash "$installer"
+          unity="$UNITY_CLI_HOME/bin/unity"
+          test "$("$unity" --version)" = "$UNITY_CLI_VERSION"
+          printf '%s\n' "$UNITY_CLI_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Sign in to Unity in your browser
+        id: unity-login
+        timeout-minutes: 10
+        run: |
+          printf '%s\n' 'Open the auth_url below in your browser. Sign in with your Unity Personal account.'
+          timeout 9m unity auth login --format json >/dev/null
+
+      - name: Activate Unity Personal
+        run: |
+          umask 077
+          activation="$RUNNER_TEMP/unity-personal-activation.json"
+          trap 'rm -f -- "$activation"' EXIT
+          result=0
+          unity license activate --personal --accept-eula --non-interactive --format json > "$activation" 2>/dev/null || result=$?
+          jq -ce '{success, errors: [.errors[]?.code]}' "$activation"
+          test "$result" = 0
+          unity license status --non-interactive --format json 2>/dev/null |
+            jq -e '.success and .data.active and any(.data.licenses[]?; .product == "Unity Personal")' >/dev/null
+          printf '%s\n' 'Unity Personal is active on this runner.'
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.source-commit || github.sha }}
+          fetch-depth: 0
+          lfs: true
+          persist-credentials: false
+
+      - name: Verify source and prepare the Unity toolchain
+        id: source
+        env:
+          BUILD_PROFILE: ${{ inputs.build-profile }}
+        run: |
+          source_commit="$(git rev-parse HEAD)"
+          if ! git merge-base --is-ancestor "$source_commit" "$GITHUB_SHA"; then
+            echo '::error::The source commit must be in the default branch history at dispatch time.'
+            exit 1
+          fi
+          test -f "$BUILD_PROFILE"
+          editor_version="$(awk '$1 == "m_EditorVersion:" {print $2}' ProjectSettings/ProjectVersion.txt)"
+          [[ "$editor_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+[abfp][0-9]+$ ]]
+          sudo rm -rf --one-file-system -- /usr/local/lib/android/sdk /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL
+          df -h "$RUNNER_TEMP"
+          download_path="$(unity cache info --format json | jq -er '.data.path | select(type == "string" and length > 0)')"
+          printf 'commit=%s\neditor-version=%s\ndownload-path=%s\n' "$source_commit" "$editor_version" "$download_path" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Unity installer archives
+        id: installers
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: ${{ steps.source.outputs.download-path }}
+          key: unity-downloads-ubuntu24-x64-android-${{ steps.source.outputs.editor-version }}
+
+      - name: Download Unity and Android installer archives
+        if: inputs.platform == 'android' && steps.installers.outputs.cache-hit != 'true'
+        env:
+          EDITOR_VERSION: ${{ steps.source.outputs.editor-version }}
+        run: unity install "$EDITOR_VERSION" --download-only --module android --child-modules --yes --non-interactive --accept-eula
+
+      - name: Save Unity and Android installer archives
+        if: inputs.platform == 'android' && steps.installers.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: ${{ steps.source.outputs.download-path }}
+          key: ${{ steps.installers.outputs.cache-primary-key }}
+
+      - name: Install Unity and the selected build modules
+        env:
+          EDITOR_VERSION: ${{ steps.source.outputs.editor-version }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          case "$PLATFORM" in
+            ios) modules=(--module ios) ;;
+            android) modules=(--module android --child-modules) ;;
+          esac
+          mkdir -p "$RUNNER_TEMP/unity-editors"
+          unity install-path --set "$RUNNER_TEMP/unity-editors" --non-interactive
+          unity install "$EDITOR_VERSION" "${modules[@]}" --yes --non-interactive --accept-eula
+          unity cache clean --yes --non-interactive
+          df -h "$RUNNER_TEMP"
+
+      - name: Export the Xcode project
+        if: inputs.platform == 'ios'
+        env:
+          BUILD_PROFILE: ${{ inputs.build-profile }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          export_dir="$RUNNER_TEMP/unity-ios-export"
+          mkdir -p "$export_dir"
+          unity build "$GITHUB_WORKSPACE" --profile "$BUILD_PROFILE" \
+            --args='-refreshImportMode InProcess' --output-path "$export_dir/Xcode" \
+            --log-file "$export_dir/unity.log" --format human --non-interactive
+          test -s "$export_dir/Xcode/Unity-iPhone.xcodeproj/project.pbxproj"
+          build_number="$(python3 -c 'import plistlib, sys; print(plistlib.loads(sys.stdin.buffer.read())["CFBundleVersion"])' < "$export_dir/Xcode/Info.plist")"
+          [[ "$build_number" =~ ^[1-9][0-9]*$ ]]
+          tar -czf "$export_dir/Xcode.tar.gz" -C "$export_dir" Xcode
+          rm -rf -- "$export_dir/Xcode"
+          printf '%s\n' "$SOURCE_COMMIT" > "$export_dir/source-commit.txt"
+          printf '%s\n' "$build_number" > "$export_dir/build-number.txt"
+
+      - name: Keep the Xcode project for the signing job
+        if: inputs.platform == 'ios'
+        id: xcode-artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: unity-xcode-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/unity-ios-export/Xcode.tar.gz
+            ${{ runner.temp }}/unity-ios-export/source-commit.txt
+            ${{ runner.temp }}/unity-ios-export/build-number.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      - name: Build the Android App Bundle
+        if: inputs.platform == 'android'
+        env:
+          BUILD_PROFILE: ${{ inputs.build-profile }}
+          GRADLE_USER_HOME: ${{ runner.temp }}/unity-android-gradle
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          unset ANDROID_HOME ANDROID_SDK_ROOT ANDROID_NDK ANDROID_NDK_HOME ANDROID_NDK_LATEST_HOME ANDROID_NDK_ROOT
+          mkdir -p "$GRADLE_USER_HOME/init.d"
+          cat > "$GRADLE_USER_HOME/init.d/plugin-repositories.init.gradle" <<'GRADLE'
+          gradle.settingsEvaluated { settings ->
+              def repositories = settings.pluginManagement.repositories
+              def pluginPortal = repositories.findByName('Gradle Central Plugin Repository')
+              if (pluginPortal != null) {
+                  repositories.remove(pluginPortal)
+                  repositories.addLast(pluginPortal)
+              }
+          }
+          GRADLE
+          build_dir="$RUNNER_TEMP/unity-android-export"
+          mkdir -p "$build_dir"
+          unity build "$GITHUB_WORKSPACE" --profile "$BUILD_PROFILE" \
+            --args='-refreshImportMode InProcess' --output-path "$build_dir/Player.aab" \
+            --log-file "$build_dir/unity.log" --format human --non-interactive
+          test -s "$build_dir/Player.aab"
+          build_number="$(awk '$1 == "AndroidBundleVersionCode:" {print $2}' ProjectSettings/ProjectSettings.asset)"
+          [[ "$build_number" =~ ^[1-9][0-9]*$ ]]
+          printf '%s\n' "$SOURCE_COMMIT" > "$build_dir/source-commit.txt"
+          printf '%s\n' "$build_number" > "$build_dir/build-number.txt"
+
+      - name: Keep the Android bundle for the signing job
+        if: inputs.platform == 'android'
+        id: android-artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: unity-android-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/unity-android-export/Player.aab
+            ${{ runner.temp }}/unity-android-export/source-commit.txt
+            ${{ runner.temp }}/unity-android-export/build-number.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      - name: Sign out of Unity
+        if: always() && steps.unity-login.outcome == 'success'
+        timeout-minutes: 5
+        run: unity auth logout --yes --non-interactive
